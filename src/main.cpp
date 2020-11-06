@@ -2,7 +2,6 @@
 
 #if defined(ESP8266)
 #define FASTLED_ESP8266_RAW_PIN_ORDER
-#include <AsyncElegantOTA.h>
 #include <ESP8266WiFi.h>
 #include <DNSServer.h>
 #include <ESPAsyncWebServer.h>
@@ -16,7 +15,34 @@ namespace {
 const char* ssid = "VehicleLights";
 const char* pass = "12345678";
 
+size_t updateSize = 0;
+
+const char upload_html[] PROGMEM = \
+"<form method='POST' enctype='multipart/form-data'>\n"\
+"<h1>Vehicle Lights Updater</h1>\n"\
+"<input id='file' type='file' name='update' onchange='sub(this)' style=display:none>\n"\
+"<label id='file-input' for='file'>Click to choose file</label>\n"\
+"<input id='btn' type='submit' class=btn value='Upload' disabled>\n"\
+"</form>\n"\
+"<script>\n"\
+"function sub(obj) {\n"\
+"    var fileName = obj.value.split('\\\\');\n"\
+"    console.log(fileName);\n"\
+"    document.getElementById('file-input').innerHTML = '   '+ fileName[fileName.length-1];\n"\
+"    document.getElementById('btn').disabled = false;\n"\
+"};\n"\
+"</script>\n"\
+"<style>\n"\
+"#file-input,input{width:100%;height:44px;border-radius:4px;margin:10px auto;font-size:15px}\n"\
+"input{background:#f1f1f1;border:0;padding:0 15px}body{background:#3498db;font-family:sans-serif;font-size:14px;color:#777}\n"\
+"#file-input{padding:0;border:1px solid #ddd;line-height:44px;text-align:center;display:block;cursor:pointer}\n"\
+"form{background:#fff;max-width:50%;margin:75px auto;padding:10px;border-radius:5px;text-align:center}\n"\
+".btn{background:#3498db;color:#fff;cursor:pointer}\n"\
+".btn:disabled{background:#98342b;color:#fff;cursor:pointer}\n"\
+"</style>\n";
+
 DNSServer dnsServer;
+
 AsyncWebServer server(80);
 
 const uint8_t ledPin = D1;
@@ -71,19 +97,71 @@ bool rightPressed = false;
 }
 
 #if defined(ESP8266)
-class CaptiveRequestHandler : public AsyncWebHandler {
-public:
-  CaptiveRequestHandler() {}
-  virtual ~CaptiveRequestHandler() {}
+void updateRequestHandler(AsyncWebServerRequest *request)
+{
+    Serial.println(F("updateRequestHandler"));
+    request->send(200);
+    ESP.restart();
+}
 
-  bool canHandle(AsyncWebServerRequest *request){
-    return true;
-  }
+void drawProgress(size_t progress)
+{
+    double pcs;
+    if (updateSize == 0) {
+        pcs = 0.5;
+    } else {
+        pcs = static_cast<double>(progress) / updateSize;
+    }
+    fill_solid(leds, numLeds * pcs, CRGB(0, 40, 127));
+}
 
-  void handleRequest(AsyncWebServerRequest *request) {
-    request->redirect(F("/update"));
-  }
-};
+void updateHandler(uint8_t *data, size_t len, size_t index, size_t total, bool final)
+{
+    if (index == 0) {
+        FastLED.clear();
+        Serial.println(F("Update started!"));
+        Serial.printf_P(PSTR("Total size: %zu\n"), total);
+        
+        updateSize = total;
+        Update.runAsync(true);
+        if (!Update.begin(total, U_FLASH)) {
+            Serial.print(F("Upload begin error: "));
+            Update.printError(Serial);
+            fill_solid(leds, numLeds, CRGB(255, 0, 0));
+            return;
+        }
+    }
+    drawProgress(index + len);
+    if (Update.write(data, len) != len) {
+        Serial.print(F("Upload write error: "));
+        Update.printError(Serial);
+            fill_solid(leds, numLeds, CRGB(255, 0, 0));
+        return;
+    }
+    if (final) {
+        if (!Update.end(true)) {
+            Serial.print(F("Upload end error: "));
+            Update.printError(Serial);
+            fill_solid(leds, numLeds, CRGB(255, 0, 0));
+            return;
+        }
+        Serial.printf_P(PSTR("Update Success: %zd\nRebooting...\n"), index + len);
+        fill_solid(leds, numLeds, CRGB(0, 255, 0));
+        return;
+    }
+    ESP.wdtFeed();
+    FastLED.show();
+}
+
+void updateBodyHandler(AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+{
+    updateHandler(data, len, index, total, index + len == total);
+}
+
+void updateFileHandler(AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final)
+{
+    updateHandler(data, len, index, request->contentLength(), final);
+}
 #endif
 
 void setup(void) {
@@ -122,8 +200,14 @@ void setup(void) {
     Serial.println(WiFi.softAPIP());
 
     dnsServer.start(53, "*", WiFi.softAPIP());
-    AsyncElegantOTA.begin(&server);
-    server.addHandler(new CaptiveRequestHandler()).setFilter(ON_AP_FILTER);
+
+    server.on(PSTR("/update"), HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->send_P(200, "text/html", upload_html);
+    });
+    server.on(PSTR("/update"), HTTP_POST, updateRequestHandler, updateFileHandler, updateBodyHandler);
+    server.onNotFound([](AsyncWebServerRequest *request){
+      request->redirect(F("/update"));
+    });
     server.begin();
     Serial.println(F("Update server started"));
 
